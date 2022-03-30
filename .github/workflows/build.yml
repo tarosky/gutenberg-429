@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+    - master
+  push:
+    branches:
+    - master
+    - issue/*
+    # - dev/harai
+
+env:
+  GO_VERSION: 1.17.8
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-go@v2
+      with:
+        go-version: '~${{env.GO_VERSION}}'
+    - run: go get github.com/ahmetb/govvv
+    - name: Generate build number
+      uses: einaregilsson/build-number@v3
+      with:
+        token: ${{secrets.GITHUB_TOKEN}}
+        prefix: build_number_generator
+    - name: Print new build number
+      run: echo "Build number is $BUILD_NUMBER"
+    - name: Save the build number
+      run: echo "$BUILD_NUMBER" > work/BUILD_NUMBER
+    - name: Embed build number into code
+      run: echo "build-$BUILD_NUMBER" > ./VERSION
+    - run: ~/go/bin/govvv build -o work/429 .
+    - uses: actions/upload-artifact@v2
+      with:
+        name: artifact
+        path: work/429
+    - uses: actions/upload-artifact@v2
+      with:
+        name: build-number
+        path: work/BUILD_NUMBER
+
+  release:
+    needs:
+    - build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-20.04
+    steps:
+    - uses: actions/download-artifact@v2
+      with:
+        name: artifact
+    - uses: actions/download-artifact@v2
+      with:
+        name: build-number
+    - name: set BUILD_NUMBER
+      run: echo "BUILD_NUMBER=$(< ./BUILD_NUMBER)" >> $GITHUB_ENV
+    - id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+      with:
+        tag_name: build-${{env.BUILD_NUMBER}}
+        release_name: Build ${{env.BUILD_NUMBER}}
+        draft: false
+        prerelease: false
+    - uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+      with:
+        upload_url: ${{steps.create_release.outputs.upload_url}}
+        asset_path: ./429
+        asset_name: 429.build-${{env.BUILD_NUMBER}}-linux-amd64
+        asset_content_type: application/octet-stream
