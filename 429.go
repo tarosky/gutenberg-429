@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -176,7 +177,7 @@ func main() {
 		},
 		&cli.StringFlag{
 			Name:    "host",
-			Aliases: []string{"h"},
+			Aliases: []string{"H"},
 			Value:   "0.0.0.0",
 		},
 		&cli.IntFlag{
@@ -257,10 +258,6 @@ func main() {
 		db.SetConfig(buntdb.Config{
 			AutoShrinkPercentage: 50,
 			AutoShrinkMinSize:    500 * 1024,
-			OnExpiredSync: func(key, value string, tx *buntdb.Tx) error {
-				log.Debug("expired", zap.String("masked", key))
-				return nil
-			},
 		})
 		defer db.Close()
 
@@ -327,13 +324,18 @@ func (e *environment) run(ctx context.Context, runServer func(context.Context, *
 	e.log.Info("server exited")
 }
 
-func (e *environment) respondWithOK(c *gin.Context, ip, masked net.IP, path string, left uint) {
+func (e *environment) respondWithOK(
+	c *gin.Context,
+	ip, masked net.IP,
+	path string,
+	remaining uint,
+) {
 	e.log.Debug("response",
-		zap.Int("status", 200),
+		zap.Int("status", http.StatusOK),
 		zap.String("ip", ip.String()),
 		zap.String("masked", masked.String()),
 		zap.String("path", path),
-		zap.Uint("left", left))
+		zap.Uint("remaining", remaining))
 	c.String(http.StatusOK, "")
 	c.Writer.Flush()
 }
@@ -342,15 +344,30 @@ func (e *environment) respondWithTooManyRequests(
 	c *gin.Context,
 	ip, masked net.IP,
 	path string,
-	left uint,
 ) {
 	e.log.Debug("response",
-		zap.Int("status", 429),
+		zap.Int("status", http.StatusTooManyRequests),
 		zap.String("ip", ip.String()),
 		zap.String("masked", masked.String()),
 		zap.String("path", path),
-		zap.Uint("left", left))
+		zap.Uint("remaining", 0))
 	c.String(http.StatusTooManyRequests, "")
+	c.Writer.Flush()
+}
+
+func (e *environment) respondWithInternalServerError(
+	c *gin.Context,
+	ip, masked net.IP,
+	path string,
+	err error,
+) {
+	e.log.Debug("response",
+		zap.Int("status", http.StatusInternalServerError),
+		zap.String("ip", ip.String()),
+		zap.String("masked", masked.String()),
+		zap.String("path", path),
+		zap.Error(err))
+	c.String(http.StatusInternalServerError, "")
 	c.Writer.Flush()
 }
 
@@ -363,22 +380,120 @@ func (e *environment) maskIP(ip net.IP) net.IP {
 	return masked
 }
 
+func (e *environment) parseSeries(val string) ([]int64, error) {
+	if val == "" {
+		return make([]int64, 0, 1), nil
+	}
+
+	strs := strings.Split(val, ",")
+	series := make([]int64, 0, len(strs)+1)
+	for _, v := range strs {
+		epoch, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		series = append(series, epoch)
+	}
+
+	return series, nil
+}
+
+func (e *environment) buildValue(series []int64) string {
+	strs := make([]string, 0, len(series))
+	for _, ep := range series {
+		strs = append(strs, strconv.FormatInt(ep, 10))
+	}
+
+	return strings.Join(strs, ",")
+}
+
+func (e *environment) slideWindow(now int64, series []int64) []int64 {
+	thresh := now - int64(e.window)
+	idx := len(series) - 1
+	for i, epoch := range series {
+		if thresh < epoch {
+			idx = i
+			break
+		}
+	}
+
+	return series[idx:]
+}
+
+func (e *environment) tooMany(series []int64) bool {
+	return int(e.maxCount) < len(series)
+}
+
+func (e *environment) trim(series []int64) []int64 {
+	outside := len(series) - int(e.maxCount)
+	if outside < 0 {
+		return series
+	}
+
+	return series[outside:]
+}
+
 func (e *environment) handleRequest(c *gin.Context, ip net.IP, path string) {
 	masked := e.maskIP(ip)
 	key := masked.String()
 	now := time.Now().Unix()
+	var tooMany bool
+	var remaining uint
 
-	err := e.db.Update(func(tx *buntdb.Tx) error {
+	if err := e.db.Update(func(tx *buntdb.Tx) error {
 		val, err := tx.Get(key, true)
 		if err != nil && err != buntdb.ErrNotFound {
 			return err
 		}
 
-		if _, _, err := tx.Set(key, val, &buntdb.SetOptions{
+		series, err := e.parseSeries(val)
+		if err != nil {
+			return err
+		}
+
+		// e.log.Debug("get",
+		// 	zap.String("ip", ip.String()),
+		// 	zap.String("masked", masked.String()),
+		// 	zap.String("path", path),
+		// 	zap.Int64s("series", series))
+
+		series = e.slideWindow(now, append(series, now))
+		tooMany = e.tooMany(series)
+		series = e.trim(series)
+
+		// This should not happen.
+		if len(series) == 0 || int(e.maxCount) < len(series) {
+			e.log.Fatal("incorrect series",
+				zap.String("ip", ip.String()),
+				zap.String("masked", masked.String()),
+				zap.String("path", path),
+				zap.Int64s("series", series))
+		}
+
+		remaining = e.maxCount - uint(len(series))
+
+		if _, _, err := tx.Set(key, e.buildValue(series), &buntdb.SetOptions{
 			Expires: true,
 			TTL:     time.Duration(e.window) * time.Second,
 		}); err != nil {
 			return err
 		}
-	})
+
+		// e.log.Debug("set",
+		// 	zap.String("ip", ip.String()),
+		// 	zap.String("masked", masked.String()),
+		// 	zap.String("path", path),
+		// 	zap.Int64s("series", series))
+
+		return nil
+	}); err != nil {
+		e.respondWithInternalServerError(c, ip, masked, path, err)
+		return
+	}
+
+	if tooMany {
+		e.respondWithTooManyRequests(c, ip, masked, path)
+	} else {
+		e.respondWithOK(c, ip, masked, path, remaining)
+	}
 }
