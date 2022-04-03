@@ -355,6 +355,14 @@ func (e *environment) respondWithTooManyRequests(
 	c.Writer.Flush()
 }
 
+func (e *environment) respondWithBadRequest(c *gin.Context, path string) {
+	e.log.Debug("response",
+		zap.Int("status", http.StatusBadRequest),
+		zap.String("path", path))
+	c.String(http.StatusBadRequest, "")
+	c.Writer.Flush()
+}
+
 func (e *environment) respondWithInternalServerError(
 	c *gin.Context,
 	ip, masked net.IP,
@@ -434,6 +442,10 @@ func (e *environment) trim(series []int64) []int64 {
 }
 
 func (e *environment) handleRequest(c *gin.Context, ip net.IP, path string) {
+	if ip == nil {
+		e.respondWithBadRequest(c, path)
+		return
+	}
 	masked := e.maskIP(ip)
 	key := masked.String()
 	now := time.Now().Unix()
