@@ -484,11 +484,13 @@ func (e *environment) handleRequest(c *gin.Context, ip net.IP, path string) {
 
 		remaining = e.maxCount - uint(len(series))
 
-		if _, _, err := tx.Set(key, e.buildValue(series), &buntdb.SetOptions{
-			Expires: true,
-			TTL:     time.Duration(e.window) * time.Second,
-		}); err != nil {
-			return err
+		if !tooMany {
+			if _, _, err := tx.Set(key, e.buildValue(series), &buntdb.SetOptions{
+				Expires: true,
+				TTL:     time.Duration(e.window) * time.Second,
+			}); err != nil {
+				return err
+			}
 		}
 
 		// e.log.Debug("set",
