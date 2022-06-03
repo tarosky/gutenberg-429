@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,7 +28,8 @@ var Version string
 type configure struct {
 	window                  uint
 	maxCount                uint
-	ipv4SubnetMask          net.IPMask
+	ipv4SubnetMask          uint
+	denyPrefixes            []netip.Prefix
 	gracefulShutdownTimeout uint
 	host                    string
 	port                    int
@@ -150,6 +151,18 @@ func createLogger(ctx context.Context, logPath, errorLogPath string) *zap.Logger
 		zap.WithCaller(false)).With(zap.String("version", Version))
 }
 
+func strsToPrefixes(strs []string) ([]netip.Prefix, error) {
+	ps := make([]netip.Prefix, 0, len(strs))
+	for _, s := range strs {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return nil, err
+		}
+		ps = append(ps, p.Masked())
+	}
+	return ps, nil
+}
+
 func main() {
 	app := cli.NewApp()
 	app.Name = "429"
@@ -169,6 +182,11 @@ func main() {
 			Name:    "ipv4-subnet-mask",
 			Aliases: []string{"m"},
 			Value:   24,
+		},
+		&cli.StringSliceFlag{
+			Name:    "deny-iprange",
+			Aliases: []string{"d"},
+			Value:   cli.NewStringSlice(),
 		},
 		&cli.UintFlag{
 			Name:    "graceful-shutdown-timeout",
@@ -214,10 +232,17 @@ func main() {
 			panic(err)
 		}
 
+		denyPrefixes, err := strsToPrefixes(c.StringSlice("deny-iprange"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to parse deny-iprange: %s", err.Error())
+			panic(err)
+		}
+
 		cfg := &configure{
 			window:                  c.Uint("window"),
 			maxCount:                c.Uint("max-count"),
-			ipv4SubnetMask:          net.CIDRMask(int(c.Uint("ipv4-subnet-mask")), 32),
+			ipv4SubnetMask:          c.Uint("ipv4-subnet-mask"),
+			denyPrefixes:            denyPrefixes,
 			gracefulShutdownTimeout: c.Uint("graceful-shutdown-timeout"),
 			host:                    c.String("host"),
 			port:                    c.Int("port"),
@@ -316,7 +341,7 @@ func (e *environment) run(ctx context.Context, runServer func(context.Context, *
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 	engine.GET("/", func(c *gin.Context) {
-		e.handleRequest(c, net.ParseIP(c.Query("ip")), c.Query("path"))
+		e.handleRequest(c, c.Query("ip"), c.Query("path"))
 	})
 
 	runServer(ctx, engine)
@@ -326,7 +351,8 @@ func (e *environment) run(ctx context.Context, runServer func(context.Context, *
 
 func (e *environment) respondWithOK(
 	c *gin.Context,
-	ip, masked net.IP,
+	ip netip.Addr,
+	masked netip.Prefix,
 	path string,
 	remaining uint,
 ) {
@@ -342,7 +368,8 @@ func (e *environment) respondWithOK(
 
 func (e *environment) respondWithTooManyRequests(
 	c *gin.Context,
-	ip, masked net.IP,
+	ip netip.Addr,
+	masked netip.Prefix,
 	path string,
 ) {
 	e.log.Debug("response",
@@ -355,9 +382,25 @@ func (e *environment) respondWithTooManyRequests(
 	c.Writer.Flush()
 }
 
-func (e *environment) respondWithBadRequest(c *gin.Context, path string) {
+func (e *environment) respondWithForbidden(
+	c *gin.Context,
+	ip netip.Addr,
+	deny netip.Prefix,
+	path string,
+) {
+	e.log.Debug("response",
+		zap.Int("status", http.StatusForbidden),
+		zap.String("ip", ip.String()),
+		zap.String("deny", deny.String()),
+		zap.String("path", path))
+	c.String(http.StatusForbidden, "")
+	c.Writer.Flush()
+}
+
+func (e *environment) respondWithBadRequest(c *gin.Context, ipstr, path string) {
 	e.log.Debug("response",
 		zap.Int("status", http.StatusBadRequest),
+		zap.String("ip", ipstr),
 		zap.String("path", path))
 	c.String(http.StatusBadRequest, "")
 	c.Writer.Flush()
@@ -365,7 +408,8 @@ func (e *environment) respondWithBadRequest(c *gin.Context, path string) {
 
 func (e *environment) respondWithInternalServerError(
 	c *gin.Context,
-	ip, masked net.IP,
+	ip netip.Addr,
+	masked netip.Prefix,
 	path string,
 	err error,
 ) {
@@ -379,13 +423,12 @@ func (e *environment) respondWithInternalServerError(
 	c.Writer.Flush()
 }
 
-func (e *environment) maskIP(ip net.IP) net.IP {
-	masked := ip.Mask(e.ipv4SubnetMask)
-	if masked == nil {
-		return ip
+func (e *environment) maskIP(ip netip.Addr) netip.Prefix {
+	if ip.Is4() {
+		return netip.PrefixFrom(ip, int(e.ipv4SubnetMask)).Masked()
 	}
 
-	return masked
+	return netip.PrefixFrom(ip, ip.BitLen()).Masked()
 }
 
 func (e *environment) parseSeries(val string) ([]int64, error) {
@@ -441,11 +484,20 @@ func (e *environment) trim(series []int64) []int64 {
 	return series[outside:]
 }
 
-func (e *environment) handleRequest(c *gin.Context, ip net.IP, path string) {
-	if ip == nil {
-		e.respondWithBadRequest(c, path)
+func (e *environment) handleRequest(c *gin.Context, ipstr, path string) {
+	ip, err := netip.ParseAddr(ipstr)
+	if err != nil {
+		e.respondWithBadRequest(c, ipstr, path)
 		return
 	}
+
+	for _, p := range e.denyPrefixes {
+		if p.Contains(ip) {
+			e.respondWithForbidden(c, ip, p, path)
+			return
+		}
+	}
+
 	masked := e.maskIP(ip)
 	key := masked.String()
 	now := time.Now().Unix()
