@@ -22,6 +22,7 @@ jobs:
       with:
         go-version: '~${{env.GO_VERSION}}'
     - run: go get github.com/ahmetb/govvv
+    - run: go install github.com/ahmetb/govvv
     - name: Generate build number
       uses: einaregilsson/build-number@v3
       with:
