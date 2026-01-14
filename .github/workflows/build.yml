@@ -3,12 +3,12 @@ name: CI
 on:
   pull_request:
     branches:
-    - master
+      - master
   push:
     branches:
-    - master
-    - issue/*
-    # - dev/harai
+      - master
+      - issue/*
+      # - dev/harai
 
 env:
   GO_VERSION: 1.25.3
@@ -16,60 +16,76 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    container:
+      # Stick to older glibc for compatibility.
+      # Ref: https://tech.guitarrapc.com/entry/2025/04/02/235900
+      image: ubuntu:20.04
     steps:
-    - uses: actions/checkout@main
-    - uses: actions/setup-go@main
-      with:
-        go-version: '~${{env.GO_VERSION}}'
-    - run: go get github.com/ahmetb/govvv
-    - run: go install github.com/ahmetb/govvv
-    - name: Generate build number
-      uses: onyxmueller/build-tag-number@main
-      with:
-        token: ${{secrets.GITHUB_TOKEN}}
-        prefix: build_number_generator
-    - name: Print new build number
-      run: echo "Build number is $BUILD_NUMBER"
-    - name: Save the build number
-      run: echo "$BUILD_NUMBER" > work/BUILD_NUMBER
-    - name: Embed build number into code
-      run: echo "build-$BUILD_NUMBER" > ./VERSION
-    - run: ~/go/bin/govvv build -o work/429 .
-    - uses: actions/upload-artifact@main
-      with:
-        name: artifact
-        path: work/429
-    - uses: actions/upload-artifact@main
-      with:
-        name: build-number
-        path: work/BUILD_NUMBER
+      # Workaround for error:
+      # error obtaining VCS status: exit status 128
+      #     Use -buildvcs=false to disable VCS stamping.
+      - run: chown root:root .
+      - name: Show glibc version
+        run: ldd --version
+      - name: apt-get
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y unzip curl git autoconf build-essential ca-certificates tzdata
+      - uses: actions/checkout@main
+      - uses: actions/setup-go@main
+        with:
+          go-version: "~${{env.GO_VERSION}}"
+      - run: go get github.com/ahmetb/govvv
+      - run: go install github.com/ahmetb/govvv
+      - name: Generate build number
+        uses: onyxmueller/build-tag-number@main
+        with:
+          token: ${{secrets.GITHUB_TOKEN}}
+          prefix: build_number_generator
+      - name: Print new build number
+        run: echo "Build number is $BUILD_NUMBER"
+      - name: Save the build number
+        run: echo "$BUILD_NUMBER" > work/BUILD_NUMBER
+      - name: Embed build number into code
+        run: echo "build-$BUILD_NUMBER" > ./VERSION
+      - run: ~/go/bin/govvv build -o work/429 .
+      - uses: actions/upload-artifact@main
+        with:
+          name: artifact
+          path: work/429
+      - uses: actions/upload-artifact@main
+        with:
+          name: build-number
+          path: work/BUILD_NUMBER
 
   release:
     needs:
-    - build
+      - build
     if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     env:
       # Workaround for https://github.com/github/vscode-github-actions/issues/222
       BUILD_NUMBER: ""
     steps:
-    - uses: actions/download-artifact@main
-      with:
-        name: artifact
-    - uses: actions/download-artifact@main
-      with:
-        name: build-number
-    - name: set BUILD_NUMBER
-      run: echo "BUILD_NUMBER=$(< ./BUILD_NUMBER)" >> $GITHUB_ENV
-    - run: mv 429 429.build-${{env.BUILD_NUMBER}}-linux-amd64
-    - id: create_release
-      uses: softprops/action-gh-release@master
-      env:
-        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
-      with:
-        tag_name: build-${{env.BUILD_NUMBER}}
-        name: Build ${{env.BUILD_NUMBER}}
-        draft: false
-        prerelease: false
-        files: |
-          429.*
+      - uses: actions/download-artifact@main
+        with:
+          name: artifact
+      - uses: actions/download-artifact@main
+        with:
+          name: build-number
+      - name: set BUILD_NUMBER
+        run: echo "BUILD_NUMBER=$(< ./BUILD_NUMBER)" >> $GITHUB_ENV
+      - run: mv 429 429.build-${{env.BUILD_NUMBER}}-linux-amd64
+      - id: create_release
+        uses: softprops/action-gh-release@master
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        with:
+          tag_name: build-${{env.BUILD_NUMBER}}
+          name: Build ${{env.BUILD_NUMBER}}
+          draft: false
+          prerelease: false
+          files: |
+            429.*
