@@ -1,6 +1,6 @@
 module github.com/tarosky/gutenberg-429
 
-go 1.18
+go 1.25
 
 require (
 	github.com/gin-gonic/gin v1.8.0
@@ -10,6 +10,7 @@ require (
 )
 
 require (
+	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.2 // indirect
 	github.com/gin-contrib/sse v0.1.0 // indirect
 	github.com/go-playground/locales v0.14.0 // indirect

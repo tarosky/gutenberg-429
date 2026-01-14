@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coreos/go-systemd/daemon"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/buntdb"
 	"github.com/urfave/cli/v2"
@@ -259,7 +260,7 @@ func main() {
 
 		if cfg.pidFile != "" {
 			pid := []byte(strconv.Itoa(os.Getpid()))
-			if err := ioutil.WriteFile(cfg.pidFile, pid, 0644); err != nil {
+			if err := os.WriteFile(cfg.pidFile, pid, 0644); err != nil {
 				log.Panic(
 					"failed to create PID file",
 					zap.String("path", cfg.pidFile),
@@ -299,7 +300,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	sigkill := make(chan os.Signal)
+	sigkill := make(chan os.Signal, 1)
 	signal.Notify(sigkill, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
 		<-sigkill
@@ -321,9 +322,19 @@ func (e *environment) runServer(ctx context.Context, engine *gin.Engine) {
 	}
 
 	go func() {
+		listen, err := net.Listen("tcp", srv.Addr)
+		if err != nil {
+			e.log.Panic("server failed to listen", zap.Error(err))
+			return
+		}
+
+		_, _ = daemon.SdNotify(false, daemon.SdNotifyReady)
 		e.log.Info("server started")
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			e.log.Panic("server finished abnormally", zap.Error(err))
+
+		if err := srv.Serve(listen); err != nil {
+			if err != http.ErrServerClosed {
+				e.log.Panic("server finished abnormally", zap.Error(err))
+			}
 		}
 	}()
 
